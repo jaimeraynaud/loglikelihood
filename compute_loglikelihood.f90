@@ -15,7 +15,7 @@ contains
     real(8) :: t0, t1
 
     call cpu_time(t0)
-    write(*, '(A)') '[readnicerlc] Opening nicer_profile.dat'
+    !write(*, '(A)') '[readnicerlc] Opening nicer_profile.dat'
 
     open(21, file='nicer_profile.dat', status='old', action='read', iostat=ios)
     if (ios /= 0) then
@@ -24,7 +24,7 @@ contains
       return
     end if
 
-    write(*, '(A)') '[readnicerlc] Reading observed lightcurve rows'
+    !write(*, '(A)') '[readnicerlc] Reading observed lightcurve rows'
     m = 1
     do
       read(21, *, iostat=ios) x, y
@@ -37,7 +37,7 @@ contains
     close(21)
 
     ndataact = m - 1
-    write(*, '(A,I0)') '[readnicerlc] Rows read: ', ndataact
+    !write(*, '(A,I0)') '[readnicerlc] Rows read: ', ndataact
     if (ndataact <= 0) return
 
     vmx = 0.0d0
@@ -51,7 +51,7 @@ contains
     end do
 
     call cpu_time(t1)
-    write(*, '(A,F10.3,A)') '[readnicerlc] Done in ', t1 - t0, ' s'
+    !write(*, '(A,F10.3,A)') '[readnicerlc] Done in ', t1 - t0, ' s'
   end subroutine readnicerlc
 
   real(8) function loglik(datalc, errorlc, modellc, ndata, ndataact)

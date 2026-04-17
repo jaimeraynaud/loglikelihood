@@ -1,5 +1,6 @@
 program batch_loglikelihood
   use likelihood_mod, only : readnicerlc, loglik
+  use mpi
   implicit none
 
   ! Parameters
@@ -13,7 +14,7 @@ program batch_loglikelihood
 
   ! Variables
   character(len=256), allocatable :: file_list(:)
-  integer :: n_files, i, n_to_process
+  integer :: n_files, i, n_to_process, ierr, rank, nprocs, global_best_rank
   character(len=256) :: arg1
   logical :: use_all
 
@@ -32,6 +33,15 @@ program batch_loglikelihood
   real(8), allocatable :: global_param_loglik_sum(:,:)
   logical :: first
 
+  ! MPI and reduction temporaries
+  real(8) :: all_best_loglik
+  integer :: best_owner
+  real(8), allocatable :: global_param_loglik_sum_all(:,:)
+
+  call MPI_Init(ierr)
+  call MPI_Comm_rank(MPI_COMM_WORLD, rank, ierr)
+  call MPI_Comm_size(MPI_COMM_WORLD, nprocs, ierr)
+
   ! --- Parse arguments ---
   arg1 = ''
   call get_command_argument(1, arg1)
@@ -44,12 +54,24 @@ program batch_loglikelihood
     if (i /= 0 .or. n_to_process <= 0) n_to_process = 1
   end if
 
-  ! --- List files ---
-  call list_files_with_prefix(data_dir, file_prefix, file_list, n_files)
+  ! --- List files (only on rank 0), then broadcast to all ranks ---
+  if (rank == 0) then
+    call list_files_with_prefix(data_dir, file_prefix, file_list, n_files)
+    if (n_files == 0) then
+      write(*,*) '[batch_loglikelihood] No files found.'
+    end if
+  else
+    n_files = 0
+  end if
+  ! Broadcast n_files to all ranks
+  call MPI_Bcast(n_files, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
   if (n_files == 0) stop '[batch_loglikelihood] No files found.'
+  ! Allocate file_list on all ranks
+  if (rank /= 0) allocate(file_list(n_files))
+  ! Broadcast file names (as a big character array)
+  call bcast_file_list(file_list, n_files, 256, rank, ierr)
   if (use_all) n_to_process = n_files
   if (n_to_process > n_files) n_to_process = n_files
-
   ! --- Read observed data ---
   ndata = expected_bins
   allocate(datalc(ndata, 2), errorlc(ndata))
@@ -63,36 +85,80 @@ program batch_loglikelihood
   global_best_loglik = -1.0d99
   global_param_loglik_sum = 0.0d0
   do i = 1, n_to_process
-    call process_model_file(trim(data_dir)//trim(file_list(i)), datalc, errorlc, ndata, ndataact, &
-         best_loglik, best_model, best_params, param_loglik_sum)
-    ! Update global best
-    if (first .or. best_loglik > global_best_loglik) then
-      global_best_loglik = best_loglik
-      global_best_model = best_model
-      global_best_params = best_params
-      first = .false.
+    if (mod(i-1, nprocs) == rank) then
+      call process_model_file(trim(data_dir)//trim(file_list(i)), datalc, errorlc, ndata, ndataact, &
+           best_loglik, best_model, best_params, param_loglik_sum)
+      ! Update local best
+      if (first .or. best_loglik > global_best_loglik) then
+        global_best_loglik = best_loglik
+        global_best_model = best_model
+        global_best_params = best_params
+        first = .false.
+      end if
+      ! Accumulate parameter bin loglikelihoods
+      global_param_loglik_sum = global_param_loglik_sum + param_loglik_sum
     end if
-    ! Accumulate parameter bin loglikelihoods
-    global_param_loglik_sum = global_param_loglik_sum + param_loglik_sum
   end do
 
-  ! Print only the global best parameters and light curve
-  write(*, '(A,ES24.14)') 'Best loglikelihood: ', global_best_loglik
-  write(*, '(A)') 'Best parameters:'
-  do i = 1, size(global_best_params)
-    write(*, '(A,I0,A,ES24.14)') '  p', i, ' = ', global_best_params(i)
-  end do
-  write(*, '(A)') 'Best model lightcurve:'
-  do i = 1, size(global_best_model)
-    write(*, '(I8,1X,ES24.14)') i, global_best_model(i)
-  end do
+  ! --- MPI reduction for best loglikelihood ---
+  call MPI_Allreduce(global_best_loglik, all_best_loglik, 1, MPI_DOUBLE_PRECISION, MPI_MAX, MPI_COMM_WORLD, ierr)
+  ! Find which rank owns the global best
+  if (abs(global_best_loglik - all_best_loglik) < 1d-10) then
+    best_owner = rank
+  else
+    best_owner = -1
+  end if
+  call MPI_Allreduce(best_owner, global_best_rank, 1, MPI_INTEGER, MPI_MAX, MPI_COMM_WORLD, ierr)
 
-  ! Write output files in output/ directory
-  call write_best_lightcurve(global_best_model, 'output/best_model_lightcurve.dat')
-  call write_best_params(global_best_params, 'output/best_model_params.dat')
-  call write_param_binning(global_param_loglik_sum, 'output/param_binning_output.dat')
+  ! Broadcast best params and model from owner to all
+  call MPI_Bcast(global_best_params, expected_params, MPI_DOUBLE_PRECISION, global_best_rank, MPI_COMM_WORLD, ierr)
+  call MPI_Bcast(global_best_model, ndataact, MPI_DOUBLE_PRECISION, global_best_rank, MPI_COMM_WORLD, ierr)
+
+  ! --- MPI reduction for parameter bin loglikelihoods ---
+  if (rank == 0) then
+    allocate(global_param_loglik_sum_all(expected_params, nparam_bins))
+  end if
+  call MPI_Reduce(global_param_loglik_sum, global_param_loglik_sum_all, expected_params*nparam_bins, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+
+  ! Only rank 0 prints and writes output
+  if (rank == 0) then
+    write(*, '(A,ES24.14)') 'Best loglikelihood: ', all_best_loglik
+    write(*, '(A)') 'Best parameters:'
+    do i = 1, size(global_best_params)
+      write(*, '(A,I0,A,ES24.14)') '  p', i, ' = ', global_best_params(i)
+    end do
+    write(*, '(A)') 'Best model lightcurve:'
+    do i = 1, size(global_best_model)
+      write(*, '(I8,1X,ES24.14)') i, global_best_model(i)
+    end do
+    call write_best_lightcurve(global_best_model, 'output/best_model_lightcurve.dat')
+    call write_best_params(global_best_params, 'output/best_model_params.dat')
+    call write_param_binning(global_param_loglik_sum_all, 'output/param_binning_output.dat')
+  end if
+
+
+  call MPI_Finalize(ierr)
 
 contains
+
+  subroutine bcast_file_list(file_list, n_files, maxlen, rank, ierr)
+    character(len=*), allocatable, intent(inout) :: file_list(:)
+    integer, intent(in) :: n_files, maxlen, rank
+    integer, intent(out) :: ierr
+    character(len=maxlen) :: buffer(n_files)
+    integer :: i
+    if (rank == 0) then
+      do i = 1, n_files
+        buffer(i) = file_list(i)
+      end do
+    end if
+    call MPI_Bcast(buffer, n_files*maxlen, MPI_CHARACTER, 0, MPI_COMM_WORLD, ierr)
+    if (rank /= 0) then
+      do i = 1, n_files
+        file_list(i) = buffer(i)
+      end do
+    end if
+  end subroutine bcast_file_list
 
   subroutine write_best_lightcurve(model, path)
     real(8), intent(in) :: model(:)
@@ -101,7 +167,7 @@ contains
     open(newunit=unit, file=path, status='replace', action='write', iostat=ios)
     if (ios /= 0) return
     do i = 1, size(model)
-      write(unit, '(I8,1X,ES24.14)') i, model(i)
+      write(unit, '(F10.6,1X,ES24.14)') real(i-1,8)/real(expected_bins,8), model(i)
     end do
     close(unit)
   end subroutine write_best_lightcurve
